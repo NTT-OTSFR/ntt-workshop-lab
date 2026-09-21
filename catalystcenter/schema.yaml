@@ -1,0 +1,144 @@
+---
+catalyst_center: include('catalyst_center', required=False)
+defaults: any(required=False)
+---
+catalyst_center:
+  sites: include('sites', required=False)
+  network_settings: include('network_settings', required=False)
+  fabric: include('fabric', required=False)
+  inventory: include('inventory', required=False)
+
+sites:
+  areas: list(include('site'), required=False)
+  buildings: list(include('site_building'), required=False)
+  floors: list(include('site_floor'), required=False)
+
+site:
+  name: str(min=1)
+  parent_name: str(required=False)
+  network_settings: include('site_network_settings', required=False)
+  ip_pools_reservations: list(str(min=1), required=False)
+
+site_building:
+  name: str(min=1)
+  parent_name: str(min=1, required=False)
+  latitude: num(required=False)
+  longitude: num(required=False)
+  country: str(required=False)
+  ip_pools_reservations: list(str(min=1), required=False)
+
+site_floor:
+  name: str(min=1)
+  parent_name: str(min=1, required=False)
+  floor_number: int(required=False)
+
+site_network_settings:
+  aaa_servers: str(required=False)
+  network: str(required=False)
+  telemetry: str(required=False)
+
+network_settings:
+  aaa_servers: list(include('aaa_servers'), required=False)
+  ip_pools: list(include('ip_pool'), required=False)
+
+aaa_servers:
+  name: str(min=1)
+  network_aaa: include('aaa_server_settings', required=False)
+  client_and_endpoint_aaa: include('aaa_server_settings', required=False)
+
+aaa_server_settings:
+  server_type: enum('ISE', 'AAA')
+  protocol: enum('RADIUS', 'TACACS')
+  primary_ip: ip(version=4, required=False)
+  secondary_ip: ip(version=4, required=False)
+  pan: ip(version=4, required=False)
+
+ip_pool:
+  name: str(min=1)
+  ip_address_space: enum('IPv4', 'IPv6', required=False)
+  ip_pool_cidr: str(required=False)
+  ip_pools_reservations: list(include('ip_pool_reservation'), required=False)
+
+ip_pool_reservation:
+  name: str(min=1)
+  prefix_length: int(min=1, max=128, required=False)
+  subnet: ip(required=False)
+  gateway: ip(required=False)
+  dns_servers: list(ip(), required=False)
+  dhcp_servers: list(ip(), required=False)
+
+fabric:
+  l3_virtual_networks: list(include('l3_virtual_network'), required=False)
+  transits: list(include('fabric_transit'), required=False)
+  fabric_sites: list(include('fabric_site'), required=False)
+  border_devices: list(include('border_device'), required=False)
+
+l3_virtual_network:
+  name: str(min=1)
+
+fabric_transit:
+  name: str(min=1)
+  type: enum('IP_BASED_TRANSIT', required=False)
+  routing_protocol_name: enum('BGP', required=False)
+  autonomous_system_number: int(min=1, max=4294967295, required=False)
+
+fabric_site:
+  name: str(min=1)
+  authentication_template: include('authentication_template', required=False)
+  pub_sub_enabled: bool(required=False)
+  l3_virtual_networks: list(str(min=1), required=False)
+  anycast_gateways: list(include('anycast_gateway'), required=False)
+
+authentication_template:
+  name: str(min=1)
+
+anycast_gateway:
+  ip_pool_name: str(min=1)
+  l3_virtual_network: str(min=1)
+  traffic_type: enum('DATA', 'VOICE', required=False)
+  auto_generate_vlan_name: bool(required=False)
+
+border_device:
+  name: str(min=1)
+  border_types: list(enum('LAYER_2', 'LAYER_3'), required=False)
+  default_exit: bool(required=False)
+  import_external_routes: bool(required=False)
+  local_autonomous_system_number: int(min=1, max=4294967295, required=False)
+  l3_handoffs: list(include('l3_handoff'), required=False)
+
+l3_handoff:
+  name: str(min=1)
+  interfaces: list(include('l3_handoff_interface'), required=False)
+
+l3_handoff_interface:
+  name: str(min=1)
+  virtual_networks: list(include('l3_handoff_virtual_network'), required=False)
+
+l3_handoff_virtual_network:
+  name: str(min=1)
+  local_ip_address: str(required=False)
+  peer_ip_address: str(required=False)
+  vlan: int(min=1, max=4094, required=False)
+
+inventory:
+  devices: list(include('device'), required=False)
+
+device:
+  name: str(min=1)
+  fqdn_name: str(required=False)
+  device_ip: ip(required=False)
+  pid: str(required=False)
+  state: enum('INIT', 'PNP', 'PROVISION', 'REPROVISION', 'ASSIGN')
+  device_role: enum('ACCESS', 'CORE', 'DISTRIBUTION', 'BORDER ROUTER')
+  site: str(min=1)
+  fabric_site: str(required=False)
+  fabric_roles: list(enum('BORDER_NODE', 'CONTROL_PLANE_NODE', 'EDGE_NODE', 'WIRELESS_CONTROLLER_NODE', 'EMBEDDED_WIRELESS_CONTROLLER_NODE'), required=False)
+  port_assignments: list(include('port_assignment'), required=False)
+
+port_assignment:
+  interface_name: str(required=False)
+  connected_device_type: enum('USER_DEVICE', 'ACCESS_POINT', 'TRUNKING_DEVICE', 'AUTHENTICATOR_SWITCH', 'SUPPLICANT_BASED_EXTENDED_NODE')
+  data_vlan_name: str(required=False)
+  voice_vlan_name: str(required=False)
+  security_group_name: str(required=False)
+  authenticate_template_name: enum('No Authentication', 'Open Authentication', 'Closed Authentication', 'Low Impact', required=False)

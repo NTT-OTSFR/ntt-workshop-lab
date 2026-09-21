@@ -1,0 +1,220 @@
+###############################################################################
+# GitHub Actions Workflow – Meraki Destroy Networks
+#
+# Tears down all Terraform-managed resources (networks and dependencies)
+# using `terraform destroy`. Triggered manually only, with a confirmation
+# gate to prevent accidental execution. Operates on meraki/.
+###############################################################################
+
+name: Meraki Cleanup – Delete Branch Networks
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm you want to tear down all networks and dependencies'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.ref }}-meraki
+  cancel-in-progress: false
+
+env:
+  TF_VAR_meraki_api_key: ${{ secrets.MERAKI_API_KEY }}
+  TF_IN_AUTOMATION: "true"
+  MERAKI_API_KEY:                    ${{ secrets.MERAKI_API_KEY }}
+  MERAKI_DASHBOARD_API_KEY:          ${{ secrets.MERAKI_API_KEY }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1 – Safety gate: verify the user typed "destroy"
+  # ───────────────────────────────────────────────────────────────────────
+  confirm:
+    name: Confirm Destroy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation input
+        run: |
+          if [ "${{ inputs.confirm }}" != "destroy" ]; then
+            echo "❌ Confirmation failed. You must type 'destroy' to proceed."
+            echo "   Received: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+          echo "✅ Confirmation accepted – proceeding with destroy."
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2 – Destroy Plan: show what will be destroyed before executing
+  # ───────────────────────────────────────────────────────────────────────
+  destroy-plan:
+    name: Destroy Plan
+    needs: [confirm]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Generate merged configuration
+        run: |
+          echo "📦 Generating merged YAML data model for destroy context..."
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -target='module.meraki.module.model.local_sensitive_file.model[0]'
+          echo "✅ merged_configuration.nac.yaml created successfully."
+          ls -lh merged_configuration.nac.yaml
+
+      - name: Upload merged configuration
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-merged-config
+          path: meraki/merged_configuration.nac.yaml
+          retention-days: 7
+
+      - name: Restore Terraform state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}
+          restore-keys: |
+            terraform-state-meraki-
+
+      - name: Terraform destroy plan
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "  Generating destroy plan..."
+          echo "═══════════════════════════════════════════════════"
+          terraform plan -destroy -out=destroy.tfplan -input=false 2>&1
+          terraform show -no-color destroy.tfplan > destroy_plan.txt
+
+          echo ""
+          echo "═══════════════════════════════════════════════════"
+          echo "  Resources to be destroyed:"
+          echo "═══════════════════════════════════════════════════"
+          grep -cE '# .* will be destroyed' destroy_plan.txt | xargs -I{} echo "  Total: {} resource(s)"
+          echo ""
+          grep -E '# .* will be destroyed' destroy_plan.txt || echo "  (none)"
+
+      - name: Upload destroy plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-destroy-plan-outputs
+          path: |
+            meraki/destroy.tfplan
+            meraki/destroy_plan.txt
+          retention-days: 7
+
+      - name: Upload state for destroy job
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-terraform-state-pre-destroy
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 3 – Destroy: execute terraform destroy
+  # ───────────────────────────────────────────────────────────────────────
+  destroy:
+    name: Destroy
+    needs: [destroy-plan]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 120
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download merged configuration
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-merged-config
+          path: meraki
+
+      - name: Download destroy plan
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-destroy-plan-outputs
+          path: meraki
+
+      - name: Restore Terraform state
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: meraki-terraform-state-pre-destroy
+          path: meraki
+
+      - name: Terraform destroy
+        id: destroy
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "  🔥 Executing terraform destroy..."
+          echo "═══════════════════════════════════════════════════"
+          terraform init -input=false
+          terraform apply -input=false -auto-approve destroy.tfplan
+          echo "✅ All networks and dependencies have been destroyed."
+
+      - name: Save empty Terraform state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload final Terraform state
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-terraform-state-post-destroy
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 90
+          overwrite: true
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          echo "## 🔥 Destroy Networks Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.destroy.outcome }}" = "success" ]; then
+            echo "✅ **All Terraform-managed networks and dependencies have been destroyed.**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ **Terraform destroy failed.** Check the logs for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f destroy_plan.txt ]; then
+            echo "<details><summary>📋 Destroy Plan</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat destroy_plan.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          fi

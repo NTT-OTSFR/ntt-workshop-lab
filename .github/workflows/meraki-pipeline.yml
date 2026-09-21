@@ -1,0 +1,511 @@
+###############################################################################
+# GitHub Actions Workflow – Meraki Deploy Small Branch as Code
+#
+# Ported from bac-lab's pipeline.yml. All Terraform/data files for this
+# solution live under meraki/, so every job runs with that as its
+# working directory.
+###############################################################################
+
+name: Meraki Branch Deployment
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-meraki
+  cancel-in-progress: false
+
+env:
+# Shared non-secret variables are defined in meraki/.env.
+# Each job loads them via: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+  TF_VAR_meraki_api_key: ${{ secrets.MERAKI_API_KEY }}
+  TF_IN_AUTOMATION: "true"
+  MERAKI_API_KEY:                    ${{ secrets.MERAKI_API_KEY }}
+  MERAKI_DASHBOARD_API_KEY:          ${{ secrets.MERAKI_API_KEY }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1 – Validate: terraform fmt + nac-validate
+  # ───────────────────────────────────────────────────────────────────────
+  validate:
+    name: Syntax and Semantics Validation
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Mark workspace as safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Terraform format check
+        run: |
+          echo "🔍 Checking Terraform formatting..."
+          terraform fmt -check | tee fmt_output.txt
+          if grep -qE '\.tf' fmt_output.txt; then
+            echo "❌ One or more Terraform files are not formatted correctly. Run 'terraform fmt' to fix them."
+            exit 1
+          else
+            echo "✅ All Terraform files are properly formatted."
+          fi
+
+      - name: Generate merged configuration
+        run: |
+          echo "📦 Generating merged configuration..."
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -target='module.meraki.module.model.local_sensitive_file.model[0]'
+          echo "📄 Checking for merged_configuration.nac.yaml..."
+          if [ ! -f merged_configuration.nac.yaml ]; then
+            echo "❌ merged_configuration.nac.yaml not found!"
+            exit 1
+          else
+            echo "✅ merged_configuration.nac.yaml generated successfully."
+            ls -lh merged_configuration.nac.yaml
+          fi
+
+      - name: NAC validate
+        run: |
+          echo "🔍 Running nac-validate..."
+          nac-validate ./merged_configuration.nac.yaml | tee validate_output.txt
+          if grep -q "ERROR" validate_output.txt; then
+            echo "❌ nac-validate failed with errors."
+            exit 1
+          else
+            echo "✅ nac-validate passed."
+          fi
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-validate-outputs
+          path: |
+            meraki/fmt_output.txt
+            meraki/validate_output.txt
+            meraki/merged_configuration.nac.yaml
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2 – Plan: generate and archive the Terraform plan
+  # ───────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
+    needs: [validate]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download merged configuration
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-validate-outputs
+          path: meraki
+
+      - name: Mark repository as safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Restore Terraform state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}
+          restore-keys: |
+            terraform-state-meraki-
+
+      - name: "🔍 Debug – Environment & Config"
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: Terraform & Provider Info"
+          echo "═══════════════════════════════════════════════════"
+          terraform version
+          echo ""
+
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: main.tf contents"
+          echo "═══════════════════════════════════════════════════"
+          cat main.tf
+          echo ""
+
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: Working directory & data files"
+          echo "═══════════════════════════════════════════════════"
+          echo "PWD: $(pwd)"
+          ls -la
+          echo ""
+          echo "data/ directory:"
+          ls -la data/ 2>/dev/null || echo "⚠️ data/ directory not found!"
+          echo ""
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: API Key & Secret Environment Variables"
+          echo "═══════════════════════════════════════════════════"
+          if [ -n "$MERAKI_API_KEY" ]; then
+            echo "✅ MERAKI_API_KEY is SET (length: ${#MERAKI_API_KEY}, first 4 chars: ${MERAKI_API_KEY:0:4}...)"
+          else
+            echo "❌ MERAKI_API_KEY is EMPTY or NOT SET"
+          fi
+
+          if [ -n "$MERAKI_DASHBOARD_API_KEY" ]; then
+            echo "✅ MERAKI_DASHBOARD_API_KEY is SET (length: ${#MERAKI_DASHBOARD_API_KEY}, first 4 chars: ${MERAKI_DASHBOARD_API_KEY:0:4}...)"
+          else
+            echo "❌ MERAKI_DASHBOARD_API_KEY is EMPTY or NOT SET"
+          fi
+
+          if [ -n "$TF_VAR_meraki_api_key" ]; then
+            echo "✅ TF_VAR_meraki_api_key is SET (length: ${#TF_VAR_meraki_api_key})"
+          else
+            echo "❌ TF_VAR_meraki_api_key is EMPTY or NOT SET"
+          fi
+          echo ""
+
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: NAC !env variables"
+          echo "═══════════════════════════════════════════════════"
+          echo "org_name=$org_name"
+          echo "vpn_hub_network_name=$vpn_hub_network_name"
+          echo "branch1_mx_serial=$branch1_mx_serial"
+          echo "branch1_ms_serial=$branch1_ms_serial"
+          echo "branch1_cw_serial=$branch1_cw_serial"
+          echo "branch2_mx_serial=$branch2_mx_serial"
+          echo "branch2_ms_serial=$branch2_ms_serial"
+          echo "branch2_cw_serial=$branch2_cw_serial"
+          echo ""
+
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: All env vars containing MERAKI or TF_VAR"
+          echo "═══════════════════════════════════════════════════"
+          env | grep -iE 'MERAKI|TF_VAR|TF_IN' | sed 's/\(.\{4\}\).*/\1****/' || true
+          echo ""
+          echo "═══════════════════════════════════════════════════"
+          echo "  DEBUG: Terraform state file"
+          echo "═══════════════════════════════════════════════════"
+          ls -la terraform.tfstate 2>/dev/null && echo "✅ Existing state found ($(wc -c < terraform.tfstate) bytes)" || echo "⚠️ No existing state – fresh deployment"
+          ls -la terraform.tfstate.backup 2>/dev/null && echo "✅ Backup state found" || echo "⚠️ No backup state"
+
+      - name: Terraform get and init
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "  Terraform Get & Init"
+          echo "═══════════════════════════════════════════════════"
+          rm -rf .terraform/modules
+          terraform get -update
+          terraform init -input=false 2>&1
+          echo ""
+          echo "Installed providers:"
+          terraform providers 2>&1 || true
+
+      - name: Terraform plan
+        run: |
+          terraform plan -out=plan.tfplan -input=false 2>&1
+          terraform show -no-color plan.tfplan > plan.txt
+          terraform show -json plan.tfplan | jq > plan.json
+          echo "✅ Plan completed and stored."
+
+      - name: Upload plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-plan-outputs
+          path: |
+            meraki/plan.tfplan
+            meraki/plan.txt
+            meraki/plan.json
+          retention-days: 7
+
+      - name: Upload state for next jobs
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-terraform-state-pre-deploy
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 3 – Deploy: apply the saved plan
+  # ───────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: [plan]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download plan
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-plan-outputs
+          path: meraki
+
+      - name: Restore Terraform state
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: meraki-terraform-state-pre-deploy
+          path: meraki
+
+      - name: Terraform apply
+        id: apply
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve plan.tfplan
+
+      - name: Save Terraform state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload Terraform state artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-terraform-state
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 90
+          overwrite: true
+
+      - name: Terraform destroy (rollback on failure)
+        if: failure() && steps.apply.outcome == 'failure'
+        run: |
+          echo "❌ Deploy failed – destroying all Terraform-managed resources to revert changes..."
+          terraform destroy -auto-approve -input=false
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 4a – Idempotency check (runs first after deploy)
+  # ───────────────────────────────────────────────────────────────────────
+  idempotency-test:
+    name: Idempotency Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download merged configuration
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-validate-outputs
+          path: meraki
+
+      - name: Download Terraform state
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-terraform-state
+          path: meraki
+
+      - name: Run idempotency check
+        run: |
+          terraform init -input=false
+          exit_code=0
+          terraform plan -input=false -out=idempotency.tfplan -detailed-exitcode || exit_code=$?
+          terraform show -no-color idempotency.tfplan > idempotency_plan.txt
+
+          if [ "$exit_code" -eq 2 ]; then
+            echo "❌ Terraform plan detected changes! Idempotency test failed."
+            echo "🗜️ Showing plan output:"
+            cat idempotency_plan.txt
+            exit 1
+          elif [ "$exit_code" -eq 0 ]; then
+            echo "✅ Terraform is idempotent. No changes detected."
+          else
+            echo "⚠️ Terraform plan failed with an unexpected exit code: $exit_code"
+            exit $exit_code
+          fi
+
+      - name: Upload idempotency artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-idempotency-results
+          path: |
+            meraki/idempotency_plan.txt
+            meraki/idempotency.tfplan
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 4b – Integration tests (runs after idempotency check)
+  # ───────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download merged configuration
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-validate-outputs
+          path: meraki
+
+      - name: Mark repository as safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Run integration tests
+        id: nac-test
+        run: |
+          echo "Delaying integration tests for 60 seconds..."
+          sleep 60
+          set -o pipefail
+          nac-test -d ./merged_configuration.nac.yaml -t ./tests/templates -o ./tests/results 2>&1 | tee test_output.txt
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          echo "## 🧪 Integration Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f tests/results/xunit.xml ]; then
+            tests=$(grep -oP 'tests="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            failures=$(grep -oP 'failures="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            errors=$(grep -oP 'errors="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            skipped=$(grep -oP 'skipped="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            passed=$((tests - failures - errors - skipped))
+
+            if [ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]; then
+              echo "✅ **All tests passed**" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "❌ **Some tests failed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|------:|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total  | $tests |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Passed | $passed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Failed | $failures |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⚠️ Errors | $errors |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⏭️ Skipped | $skipped |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ No xunit.xml found at \`tests/results/xunit.xml\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>📋 Full Test Log</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f test_output.txt ]; then
+            cat test_output.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No test output captured." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-integration-test-results
+          path: |
+            meraki/tests/results/*.html
+            meraki/tests/results/xunit.xml
+            meraki/test_output.txt
+            meraki/resolved.yaml
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Post-pipeline: failure handling
+  # Destroy only when the deploy job itself failed.
+  # ───────────────────────────────────────────────────────────────────────
+  failure-cleanup:
+    name: Failure Cleanup
+    needs: [validate, plan, deploy, integration-test, idempotency-test]
+    if: failure()
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download Terraform state
+        if: needs.deploy.result == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-terraform-state
+          path: meraki
+
+      - name: Terraform destroy on deploy failure
+        if: needs.deploy.result == 'failure'
+        run: |
+          terraform init -input=false
+          terraform destroy -auto-approve || true

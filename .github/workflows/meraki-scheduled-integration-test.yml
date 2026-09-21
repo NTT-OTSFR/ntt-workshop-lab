@@ -1,0 +1,213 @@
+###############################################################################
+# GitHub Actions Workflow – Meraki Scheduled Integration Tests
+#
+# Usage:
+#   1. Trigger manually via "Run workflow" in the Actions tab
+#   2. Choose how often periodic checks should recur (hours) or "once"
+#   3. A lightweight hourly cron heartbeat runs tests at the chosen cadence
+#   4. No periodic runs happen until the workflow is triggered manually first
+#   5. Re-run manually at any time to change the interval or run ad-hoc
+###############################################################################
+
+name: Meraki Scheduled Integration Test
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # hourly heartbeat; actual cadence set by user input
+  workflow_dispatch:
+    inputs:
+      check_interval:
+        description: 'Periodic check interval in hours ("once" = single run, no recurrence)'
+        required: true
+        type: choice
+        default: '6'
+        options:
+          - 'once'
+          - '1'
+          - '6'
+          - '12'
+          - '24'
+
+concurrency:
+  group: scheduled-integration-test-meraki
+  cancel-in-progress: true
+
+permissions:
+  contents: write          # needed to persist the interval preference
+  actions:  read           # needed to query last successful run time
+
+env:
+  MERAKI_API_KEY:                    ${{ secrets.MERAKI_API_KEY }}
+  MERAKI_DASHBOARD_API_KEY:          ${{ secrets.MERAKI_API_KEY }}
+
+jobs:
+  # ── Gate: decide whether the actual test should run ─────────────────────
+  check-schedule:
+    name: Check Schedule
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Evaluate schedule
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # ── Manual trigger → always run & persist the chosen interval ──
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "▶ Manual trigger – will run integration tests."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+            INTERVAL="${{ inputs.check_interval }}"
+            mkdir -p .github
+            echo "$INTERVAL" > .github/meraki-integration-test-schedule
+
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/meraki-integration-test-schedule
+            if ! git diff --cached --quiet; then
+              git commit -m "ci: update meraki integration-test interval → ${INTERVAL} [skip ci]"
+              git push
+              echo "  Saved interval preference: ${INTERVAL}"
+            fi
+            exit 0
+          fi
+
+          # ── Cron heartbeat → check whether a run is due ────────────────
+          CONFIG=".github/meraki-integration-test-schedule"
+          if [ ! -f "$CONFIG" ]; then
+            echo "⏭ No schedule configured – trigger the workflow manually first."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          INTERVAL=$(tr -d '[:space:]' < "$CONFIG")
+          if [ "$INTERVAL" = "once" ]; then
+            echo "⏭ Interval is 'once' – no periodic runs."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Query the last successful run of this workflow
+          LAST_ISO=$(gh run list \
+            --workflow "meraki-scheduled-integration-test.yml" \
+            --status success --limit 1 \
+            --json updatedAt -q '.[0].updatedAt' 2>/dev/null || true)
+
+          if [ -z "$LAST_ISO" ]; then
+            echo "▶ No previous successful run found – running now."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_EPOCH=$(date -d "$LAST_ISO" +%s)
+          NOW_EPOCH=$(date +%s)
+          ELAPSED_H=$(( (NOW_EPOCH - LAST_EPOCH) / 3600 ))
+
+          echo "  Last success: $LAST_ISO (${ELAPSED_H}h ago), interval: ${INTERVAL}h"
+          if [ "$ELAPSED_H" -ge "$INTERVAL" ]; then
+            echo "▶ Interval reached – running integration tests."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            REMAINING=$(( INTERVAL - ELAPSED_H ))
+            echo "⏭ Next run in ~${REMAINING}h – skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Integration test (only when the gate passes) ───────────────────────
+  integration-test:
+    name: Integration Test
+    needs: check-schedule
+    if: needs.check-schedule.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 30
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Mark repository as safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Render merged YAML model
+        run: |
+          terraform init -input=false
+          terraform apply -target=module.meraki.module.model -auto-approve -input=false
+          if [ ! -f merged_configuration.nac.yaml ]; then
+            echo "❌ merged_configuration.nac.yaml not found!"
+            exit 1
+          fi
+          chmod 644 merged_configuration.nac.yaml
+
+      - name: Run integration tests
+        id: nac-test
+        run: |
+          set -o pipefail
+          nac-test -d ./merged_configuration.nac.yaml -t ./tests/templates -o ./tests/results 2>&1 | tee test_output.txt
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          echo "## 🧪 Scheduled Integration Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f tests/results/xunit.xml ]; then
+            tests=$(grep -oP 'tests="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            failures=$(grep -oP 'failures="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            errors=$(grep -oP 'errors="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            skipped=$(grep -oP 'skipped="\K[0-9]+' tests/results/xunit.xml 2>/dev/null | head -1 || echo "0")
+            passed=$((tests - failures - errors - skipped))
+
+            if [ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]; then
+              echo "✅ **All tests passed**" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "❌ **Some tests failed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|------:|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total  | $tests |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Passed | $passed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Failed | $failures |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⚠️ Errors | $errors |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⏭️ Skipped | $skipped |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ No xunit.xml found at \`tests/results/xunit.xml\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>📋 Full Test Log</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f test_output.txt ]; then
+            cat test_output.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No test output captured." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-scheduled-integration-test-${{ github.run_number }}
+          path: |
+            meraki/tests/results/*.html
+            meraki/tests/results/xunit.xml
+            meraki/test_output.txt
+          retention-days: 7

@@ -1,0 +1,162 @@
+###############################################################################
+# GitHub Actions Workflow – CC Minimal Deploy (no validation, no tests)
+#
+# Phase 2: deploys the rest of catalystcenter/data/ on top of whatever state
+# cc-phase1-deploy.yml (Phase 1: sites + IP pools) already created.
+###############################################################################
+
+name: CC Minimal Deploy Only
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cc-deploy-only
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: catalystcenter
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1 – Plan: generate and archive the Terraform plan
+  # ───────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 30
+    environment: ntt-workshop-lab
+    permissions:
+      contents: write
+    env:
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Restore Terraform state
+        uses: ./.github/actions/tf-state-restore
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Terraform plan
+        run: |
+          terraform plan -parallelism=1 -var='yaml_directories=["data/"]' -out=plan.tfplan -input=false
+          terraform show -no-color plan.tfplan > plan.txt
+          terraform show -json plan.tfplan | jq > plan.json
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Upload plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-deploy-only-plan-outputs
+          path: |
+            catalystcenter/plan.tfplan
+            catalystcenter/plan.txt
+            catalystcenter/plan.json
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2 – Deploy: apply the saved plan
+  # ───────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: [plan]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    permissions:
+      contents: write
+    env:
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Download plan
+        uses: actions/download-artifact@v5
+        with:
+          name: cc-deploy-only-plan-outputs
+          path: catalystcenter
+
+      - name: Restore Terraform state
+        uses: ./.github/actions/tf-state-restore
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Terraform apply
+        run: terraform apply -parallelism=1 -input=false -auto-approve plan.tfplan
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Save Terraform state
+        if: always()
+        uses: ./.github/actions/tf-state-save

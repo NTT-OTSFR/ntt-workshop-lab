@@ -1,0 +1,6 @@
+---
+defaults:
+  catalyst_center:
+    sites:
+      floors:
+        length: 20

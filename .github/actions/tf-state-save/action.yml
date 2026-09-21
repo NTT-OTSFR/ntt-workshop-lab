@@ -1,0 +1,64 @@
+name: 'Save Terraform state to git'
+description: 'Commits catalystcenter/terraform.tfstate(.backup) to the cc-terraform-state branch'
+
+runs:
+  using: composite
+  steps:
+    - name: Save state to cc-terraform-state branch
+      shell: sh
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        STATE_DIR="$GITHUB_WORKSPACE/catalystcenter"
+
+        if [ ! -f "$STATE_DIR/terraform.tfstate" ]; then
+          echo "No terraform.tfstate present - nothing to save"
+          exit 0
+        fi
+
+        SCRATCH=$(mktemp -d)
+        REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+        if ! git clone --depth 1 --single-branch --branch cc-terraform-state "$REMOTE" "$SCRATCH" 2>/dev/null; then
+          echo "cc-terraform-state branch does not exist yet - creating it"
+          rm -rf "$SCRATCH"
+          mkdir -p "$SCRATCH"
+          (cd "$SCRATCH" && git init -q && git checkout -q --orphan cc-terraform-state)
+        fi
+
+        cp "$STATE_DIR/terraform.tfstate" "$SCRATCH/terraform.tfstate"
+        FILES="terraform.tfstate"
+        if [ -f "$STATE_DIR/terraform.tfstate.backup" ]; then
+          cp "$STATE_DIR/terraform.tfstate.backup" "$SCRATCH/terraform.tfstate.backup"
+          FILES="$FILES terraform.tfstate.backup"
+        fi
+
+        cd "$SCRATCH"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add $FILES
+
+        if git diff --cached --quiet; then
+          echo "No state changes to commit"
+          exit 0
+        fi
+
+        git commit -q -m "Update Terraform state (run ${GITHUB_RUN_ID})"
+
+        if ! git remote get-url origin >/dev/null 2>&1; then
+          git remote add origin "$REMOTE"
+        else
+          git remote set-url origin "$REMOTE"
+        fi
+
+        i=1
+        while [ "$i" -le 3 ]; do
+          if git push origin HEAD:cc-terraform-state; then
+            echo "Pushed Terraform state to cc-terraform-state branch"
+            break
+          fi
+          echo "Push attempt $i failed, retrying..."
+          i=$((i + 1))
+          sleep 5
+        done

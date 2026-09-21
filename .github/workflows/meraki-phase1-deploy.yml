@@ -1,0 +1,158 @@
+###############################################################################
+# GitHub Actions Workflow – Meraki Phase 1 Deploy (single minimal network)
+#
+# Deploys only meraki/data-phase1/phase1-network.nac.yaml (one network,
+# "Phase1-Network", with a minimal inline template) by pointing the module's
+# yaml_directories variable at data-phase1/ instead of the default data/.
+#
+# Shares Terraform state with the other Meraki workflows (same cache key),
+# so meraki-destroy.yml will tear this network down too, and running the
+# full meraki-deploy-only.yml afterwards will not conflict with it.
+###############################################################################
+
+name: Meraki Phase 1 Deploy Only
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-meraki
+  cancel-in-progress: false
+
+env:
+  TF_VAR_meraki_api_key: ${{ secrets.MERAKI_API_KEY }}
+  TF_IN_AUTOMATION: "true"
+  MERAKI_API_KEY:                    ${{ secrets.MERAKI_API_KEY }}
+  MERAKI_DASHBOARD_API_KEY:          ${{ secrets.MERAKI_API_KEY }}
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1 – Plan
+  # ───────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Restore Terraform state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}
+          restore-keys: |
+            terraform-state-meraki-
+
+      - name: Generate merged configuration
+        run: |
+          terraform init -input=false
+          terraform apply -target=module.meraki.module.model -auto-approve -input=false -var='yaml_directories=["data-phase1"]'
+
+      - name: Terraform plan
+        run: |
+          rm -rf .terraform/modules
+          terraform get -update
+          terraform init -input=false
+          terraform plan -var='yaml_directories=["data-phase1"]' -out=plan.tfplan -input=false 2>&1
+          terraform show -no-color plan.tfplan > plan.txt
+          terraform show -json plan.tfplan | jq > plan.json
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-phase1-plan-outputs
+          path: |
+            meraki/plan.tfplan
+            meraki/plan.txt
+            meraki/plan.json
+          retention-days: 7
+
+      - name: Upload state for next job
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-phase1-terraform-state-pre-deploy
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2 – Deploy
+  # ───────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: [plan]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.1.6
+      options: --user root
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Download plan
+        uses: actions/download-artifact@v5
+        with:
+          name: meraki-phase1-plan-outputs
+          path: meraki
+
+      - name: Restore Terraform state
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: meraki-phase1-terraform-state-pre-deploy
+          path: meraki
+
+      - name: Terraform apply
+        id: apply
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve plan.tfplan
+
+      - name: Save Terraform state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          key: terraform-state-meraki-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload Terraform state artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-phase1-terraform-state
+          path: |
+            meraki/terraform.tfstate
+            meraki/terraform.tfstate.backup
+          retention-days: 90
+          overwrite: true
+
+      - name: Terraform destroy (rollback on failure)
+        if: failure() && steps.apply.outcome == 'failure'
+        run: |
+          echo "❌ Deploy failed – destroying all Terraform-managed resources to revert changes..."
+          terraform destroy -auto-approve -input=false -var='yaml_directories=["data-phase1"]'

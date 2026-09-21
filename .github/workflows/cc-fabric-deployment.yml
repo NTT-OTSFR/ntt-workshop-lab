@@ -1,0 +1,395 @@
+###############################################################################
+# GitHub Actions Workflow – CC Fabric Deployment
+#
+# Ported from nac-catalystcenter-terraform's .gitlab-ci.yml.
+# Real credentials: username/url/max_timeout are hardcoded in main.tf;
+# CC_PASSWORD comes from the "ntt-workshop-lab" GitHub Environment's secrets.
+###############################################################################
+
+name: CC Fabric Deployment
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cc-fabric-deployment
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: catalystcenter
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 1 – Validate: terraform fmt + nac-validate
+  # ───────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Terraform format check
+        run: |
+          set -o pipefail
+          terraform fmt -check | tee fmt_output.txt
+
+      - name: NAC validate
+        run: |
+          set -o pipefail
+          nac-validate -r rules -s schema.yaml ./data/ --non-strict | tee validate_output.txt
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-validate-outputs
+          path: |
+            catalystcenter/fmt_output.txt
+            catalystcenter/validate_output.txt
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 2 – Plan: generate and archive the Terraform plan
+  # ───────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
+    needs: [validate]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 30
+    environment: ntt-workshop-lab
+    permissions:
+      contents: write
+    env:
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Restore Terraform state
+        uses: ./.github/actions/tf-state-restore
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Terraform plan
+        run: |
+          terraform plan -parallelism=1 -out=plan.tfplan -input=false
+          terraform show -no-color plan.tfplan > plan.txt
+          terraform show -json plan.tfplan | jq > plan.json
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Upload plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-plan-outputs
+          path: |
+            catalystcenter/plan.tfplan
+            catalystcenter/plan.txt
+            catalystcenter/plan.json
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 3 – Deploy: apply the saved plan
+  # ───────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: [plan]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 60
+    environment: ntt-workshop-lab
+    permissions:
+      contents: write
+    env:
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Download plan
+        uses: actions/download-artifact@v5
+        with:
+          name: cc-plan-outputs
+          path: catalystcenter
+
+      - name: Restore Terraform state
+        uses: ./.github/actions/tf-state-restore
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Terraform apply
+        run: terraform apply -parallelism=1 -input=false -auto-approve plan.tfplan
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Save Terraform state
+        if: always()
+        uses: ./.github/actions/tf-state-save
+
+      - name: Upload default values
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-defaults-yaml
+          path: catalystcenter/defaults.yaml
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 4a – Idempotency check
+  # ───────────────────────────────────────────────────────────────────────
+  test-idempotency:
+    name: Idempotency Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 30
+    environment: ntt-workshop-lab
+    env:
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Restore Terraform state
+        uses: ./.github/actions/tf-state-restore
+
+      - name: Download default values
+        uses: actions/download-artifact@v5
+        with:
+          name: cc-defaults-yaml
+          path: catalystcenter
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Run idempotency check
+        run: |
+          exit_code=0
+          terraform plan -parallelism=1 -input=false -detailed-exitcode -out=idempotency.tfplan || exit_code=$?
+          terraform show -no-color idempotency.tfplan > idempotency_plan.txt
+
+          if [ "$exit_code" -eq 2 ]; then
+            echo "❌ Terraform plan detected changes! Idempotency test failed."
+            cat idempotency_plan.txt
+            exit 1
+          elif [ "$exit_code" -eq 0 ]; then
+            echo "✅ Terraform is idempotent. No changes detected."
+          else
+            echo "⚠️ Terraform plan failed with an unexpected exit code: $exit_code"
+            exit $exit_code
+          fi
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Upload idempotency artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-idempotency-results
+          path: |
+            catalystcenter/idempotency_plan.txt
+            catalystcenter/idempotency.tfplan
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Job 4b – Integration tests
+  # ───────────────────────────────────────────────────────────────────────
+  test-integration:
+    name: Integration Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    container:
+      image: danischm/nac:0.4.0
+      options: --user root --cap-add=NET_ADMIN --device=/dev/net/tun
+    timeout-minutes: 30
+    environment: ntt-workshop-lab
+    env:
+      CC_URL: https://198.18.129.100
+      CC_USERNAME: admin
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+      CC_VPN_USERNAME: ${{ secrets.CC_VPN_USERNAME }}
+      CC_VPN_PASSWORD: ${{ secrets.CC_VPN_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Mark repository as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install VPN client
+        run: |
+          apt-get update && apt-get install -y openconnect || apk add --no-cache openconnect
+
+      - name: Download default values
+        uses: actions/download-artifact@v5
+        with:
+          name: cc-defaults-yaml
+          path: catalystcenter
+
+      - name: Connect to dCloud VPN
+        run: |
+          cp /etc/resolv.conf /tmp/resolv.conf.bak
+          echo "$CC_VPN_PASSWORD" | openconnect --background --pid-file=/tmp/openconnect.pid \
+            --user="$CC_VPN_USERNAME" --passwd-on-stdin --protocol=anyconnect \
+            dcloud-sjc-anyconnect.cisco.com
+          sleep 5
+
+      - name: Verify Catalyst Center reachability
+        run: |
+          curl -sk --max-time 10 -o /dev/null https://198.18.129.100 || {
+            echo "::error::Cannot reach 198.18.129.100 through the VPN tunnel"; exit 1; }
+
+      - name: Run integration tests
+        run: |
+          set -o pipefail
+          nac-test -d ./data -d ./defaults.yaml -t ./tests/templates -o ./tests/results/catalystcenter 2>&1 | tee test_output.txt
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          kill "$(cat /tmp/openconnect.pid)" 2>/dev/null || true
+          sleep 15
+          cp /tmp/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          echo "## 🧪 Integration Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f tests/results/catalystcenter/xunit.xml ]; then
+            tests=$(grep -oP 'tests="\K[0-9]+' tests/results/catalystcenter/xunit.xml 2>/dev/null | head -1 || echo "0")
+            failures=$(grep -oP 'failures="\K[0-9]+' tests/results/catalystcenter/xunit.xml 2>/dev/null | head -1 || echo "0")
+            errors=$(grep -oP 'errors="\K[0-9]+' tests/results/catalystcenter/xunit.xml 2>/dev/null | head -1 || echo "0")
+            skipped=$(grep -oP 'skipped="\K[0-9]+' tests/results/catalystcenter/xunit.xml 2>/dev/null | head -1 || echo "0")
+            passed=$((tests - failures - errors - skipped))
+
+            if [ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]; then
+              echo "✅ **All tests passed**" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "❌ **Some tests failed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|------:|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total  | $tests |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Passed | $passed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Failed | $failures |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⚠️ Errors | $errors |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⏭️ Skipped | $skipped |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ No xunit.xml found at \`tests/results/catalystcenter/xunit.xml\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cc-integration-test-results
+          path: |
+            catalystcenter/tests/results/catalystcenter/*.html
+            catalystcenter/tests/results/catalystcenter/xunit.xml
+            catalystcenter/test_output.txt
+          retention-days: 7

@@ -1,0 +1,16 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+.terraform*
+terraform*
+
+# Local environment secrets
+.env
+
+# Python bytecode
+**/__pycache__/
+*.pyc
+
+# Generated/merged configuration artifacts
+merged_configuration.nac.yaml
+defaults.yaml

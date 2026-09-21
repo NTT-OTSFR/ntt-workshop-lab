@@ -1,0 +1,58 @@
+###############################################################################
+# GitHub Actions Workflow – Syntax Validation
+###############################################################################
+
+name: Meraki Syntax Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  syntax-validate:
+    name: Syntax Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install iac-validate
+        run: |
+          pip install iac-validate
+          iac-validate --version
+
+      - name: Run syntax validation
+        run: |
+          set +e
+          iac-validate -r rules data/org_global.nac.yaml -s schema.yaml --verbosity DEBUG 2>&1 | tee syntax_validate_output.txt
+          exit_code=${PIPESTATUS[0]}
+
+          if [ "$exit_code" -eq 0 ]; then
+            echo "✅ Syntax validation passed – no errors found."
+          else
+            # Extract ERROR lines and surface each as a GitHub annotation
+            grep '^ERROR' syntax_validate_output.txt | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
+          exit $exit_code
+
+      - name: Upload validation output
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-syntax-validate-output
+          path: meraki/syntax_validate_output.txt
+          retention-days: 7

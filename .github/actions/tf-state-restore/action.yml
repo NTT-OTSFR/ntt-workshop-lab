@@ -1,0 +1,28 @@
+name: 'Restore Terraform state from git'
+description: 'Restores catalystcenter/terraform.tfstate(.backup) from the cc-terraform-state branch, if present'
+
+runs:
+  using: composite
+  steps:
+    - name: Restore state from cc-terraform-state branch
+      shell: sh
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        SCRATCH=$(mktemp -d)
+        REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+        if git clone --depth 1 --single-branch --branch cc-terraform-state "$REMOTE" "$SCRATCH" 2>/dev/null; then
+          if [ -f "$SCRATCH/terraform.tfstate" ]; then
+            cp "$SCRATCH/terraform.tfstate" "$GITHUB_WORKSPACE/catalystcenter/terraform.tfstate"
+            echo "Restored terraform.tfstate from cc-terraform-state branch"
+          fi
+          if [ -f "$SCRATCH/terraform.tfstate.backup" ]; then
+            cp "$SCRATCH/terraform.tfstate.backup" "$GITHUB_WORKSPACE/catalystcenter/terraform.tfstate.backup"
+          fi
+        else
+          echo "cc-terraform-state branch not found yet - continuing without restoring state"
+        fi
+
+        rm -rf "$SCRATCH"

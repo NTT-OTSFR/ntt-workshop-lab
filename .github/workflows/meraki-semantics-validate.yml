@@ -1,0 +1,64 @@
+
+###############################################################################
+# GitHub Actions Workflow – Semantics Validate
+###############################################################################
+
+name: Meraki Semantic / Business Rule Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  semantics-validate:
+    name: Semantics Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ntt-workshop-lab
+    defaults:
+      run:
+        working-directory: meraki
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Load shared env vars
+        run: grep -v '^\s*#' .env | grep -v '^\s*$' >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install iac-validate
+        run: |
+          pip install iac-validate
+          iac-validate --version
+
+      - name: Run iac-validate
+        run: |
+          set +e
+          iac-validate -r rules data/org_global.nac.yaml --non-strict --verbosity DEBUG 2>&1 | tee iac_validate_output.txt
+          exit_code=${PIPESTATUS[0]}
+
+          echo ""
+          echo "═══════════════════════════════════════════════════"
+          if [ "$exit_code" -eq 0 ]; then
+            echo "✅ iac-validate passed – no violations found."
+          else
+            echo "❌ iac-validate failed (exit code: $exit_code)"
+            echo "═══════════════════════════════════════════════════"
+            echo ""
+            # Surface each ERROR line as a GitHub annotation
+            grep '^ERROR' iac_validate_output.txt | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
+          exit $exit_code
+
+      - name: Upload validation output
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meraki-semantics-validate-output
+          path: meraki/iac_validate_output.txt
+          retention-days: 7

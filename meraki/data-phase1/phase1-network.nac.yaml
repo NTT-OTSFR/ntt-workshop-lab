@@ -1,0 +1,56 @@
+meraki:
+  domains:
+    - name: US
+      administrator:
+        name: admin
+      organizations:
+        - name: !env org_name
+          managed: false
+          login_security:
+            enforce_password_expiration: false
+            password_expiration_days: 40
+            enforce_different_passwords: true
+            num_different_passwords: 3
+            enforce_strong_passwords: true
+            enforce_account_lockout: true
+            account_lockout_attempts: 5
+            enforce_idle_timeout: true
+            idle_timeout_minutes: 90
+          snmp:
+            v2c: false
+            v3: true
+            v3_auth_mode: MD5
+            v3_auth_pass: !env v3_auth_pass
+            v3_priv_mode: AES128
+            v3_priv_pass: !env v3_priv_pass
+            peer_ips: []
+          networks:
+            - name: NTT-Phase1-Network
+              product_types:
+                - appliance
+                - switch
+                - wireless
+              time_zone: Europe/Paris
+              notes: ntt_network_notes
+              tags:
+                - ntt
+              settings:
+                local_status_page_enabled: true
+                remote_status_page: true
+                secure_port: false
+                named_vlans: true
+              snmp:
+                access: users
+                users:
+                  - username: cleu_user
+                    passphrase: !env radius_server_secret
+              syslog_servers:
+                - host: 1.2.3.4
+                  port: 514
+                  roles:
+                    - Switch Event log
+                    - Air Marshal events
+                    - Flows
+                    - URLs
+                    - Wireless Event log
+                    - Appliance Event log
