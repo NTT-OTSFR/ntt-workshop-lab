@@ -13,7 +13,7 @@ domains:
 template:
   networks: list(include('networks'), required=False)
 organizations:
-  name: str(min=1, max=128, required=False)
+  name: str(min=1, max=10 required=False)
   managed: bool(required=False)
   login_security: include('login_security', required=False)
   snmp: include('snmp', required=False)
