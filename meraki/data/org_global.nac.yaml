@@ -2,7 +2,7 @@ meraki:
   domains:
     - name: US
       administrator:
-        name: root
+        name: admin
       organizations:
         - name: !env org_name
           managed: false
